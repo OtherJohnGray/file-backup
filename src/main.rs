@@ -1,17 +1,31 @@
 use clap::Parser;
-use std::process::{Command, exit};
+use serde::Deserialize;
+use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, exit};
 
 #[derive(Parser, Debug)]
 #[command(name = "file-backup")]
 #[command(about = "Backup ZFS filesystems, ZVOLs, and Restic repositories", long_about = None)]
 struct Args {
-    /// ZFS dataset name (e.g., tank/data)
-    dataset: String,
-    
-    /// Target directory for backups
-    target_dir: PathBuf,    
+    /// Path to configuration file
+    #[arg(short, long, default_value = "/etc/file-backup/backup-config.toml")]
+    config: PathBuf,    
 }
+
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    dataset: Vec<DatasetConfig>,
+}
+
+
+#[derive(Debug, Deserialize)]
+struct DatasetConfig {
+    name: String,
+    target_dir: PathBuf,
+}
+
 
 fn main() {
     let args = Args::parse();
@@ -21,31 +35,30 @@ fn main() {
         eprintln!("Error: {}", e);
         exit(1);
     }    
-    
-    // Check if dataset is mounted
-    match is_dataset_mounted(&args.dataset) {
-        Ok(true) => println!("Dataset '{}' is mounted", args.dataset),
-        Ok(false) => {
-            eprintln!("Error: Dataset '{}' is NOT mounted", args.dataset);
-            exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error checking dataset '{}': {}", args.dataset, e);
-            exit(1);
-        }
-    }
-    
-    // Get the latest snapshot
-    match get_latest_snapshot(&args.dataset) {
-        Ok(Some(snapshot)) => println!("Latest snapshot: {}", snapshot),
-        Ok(None) => println!("No snapshots found for dataset '{}'", args.dataset),
-        Err(e) => {
-            eprintln!("Error getting snapshots for '{}': {}", args.dataset, e);
-            exit(1);
-        }
-    }
 
-    println!("Target directory: {}", args.target_dir.display());
+    // Load configuration
+    let config = match load_config(&args.config) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Error loading config file '{}': {}", args.config.display(), e);
+            exit(1);
+        }
+    };   
+
+    println!("Processing {} dataset{}...\n", config.dataset.len(), match config.dataset.len() { 1 => {""} _ => {"s"} });     
+        
+     // Process each dataset
+    for dataset_config in &config.dataset {
+        match backup_dataset(dataset_config) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                eprintln!("Skipping dataset '{}'\n", dataset_config.name);
+            }
+        }
+    }
+    
+    println!("Done!");
 }
 
 
@@ -61,6 +74,21 @@ fn check_rsync_installed() -> Result<(), String> {
         }
         Err(e) => Err(format!("Failed to check for rsync: {}", e)),
     }
+}
+
+
+fn load_config(path: &PathBuf) -> Result<Config, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    
+    let config: Config = toml::from_str(&contents)
+        .map_err(|e| format!("Failed to parse TOML: {}", e))?;
+    
+    if config.dataset.is_empty() {
+        return Err("No datasets defined in config file".to_string());
+    }
+    
+    Ok(config)
 }
 
 
@@ -86,6 +114,25 @@ fn is_dataset_mounted(dataset: &str) -> Result<bool, String> {
         .unwrap_or(false);
     
     Ok(is_mounted)
+}
+
+
+fn check_target_directory(target_dir: &PathBuf) -> Result<(), String> {
+    if !target_dir.exists() {
+        return Err(format!(
+            "Target directory '{}' does not exist. Is the removable device mounted?",
+            target_dir.display()
+        ));
+    }
+    
+    if !target_dir.is_dir() {
+        return Err(format!(
+            "'{}' exists but is not a directory",
+            target_dir.display()
+        ));
+    }
+    
+    Ok(())
 }
 
 
@@ -115,4 +162,31 @@ fn get_latest_snapshot(dataset: &str) -> Result<Option<String>, String> {
         .map(|s| s.to_string());
     
     Ok(latest)
+}
+
+
+fn backup_dataset(dataset_config: &DatasetConfig) -> Result<(), String> {
+        println!("=== Dataset: {} ===", dataset_config.name);
+        
+        // Check if target directory exists
+        if let Err(e) = check_target_directory(&dataset_config.target_dir) { return Err(e); }
+        
+        // Check if dataset is mounted
+        match is_dataset_mounted(&dataset_config.name) {
+            Ok(true) => println!("Dataset '{}' is mounted", dataset_config.name),
+            Ok(false) => { return Err(format!("Error: Dataset '{}' is NOT mounted", dataset_config.name))}
+            Err(e) => { return Err(e)}
+        }
+        
+        // Get the latest snapshot
+        match get_latest_snapshot(&dataset_config.name) {
+            Ok(Some(snapshot)) => println!("Latest snapshot: {}", snapshot),
+            Ok(None) => println!("No snapshots found for dataset '{}'", dataset_config.name),
+            Err(e) => { return Err(e) }
+        }
+        
+        println!("Target directory: {}", dataset_config.target_dir.display());
+        println!(); // Blank line between datasets
+        Ok(())
+
 }

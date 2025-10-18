@@ -7,3 +7,4 @@ edition = "2024"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9.8"
+rusqlite = { version = "0.37.0", features = ["bundled"] }

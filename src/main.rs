@@ -318,8 +318,9 @@ fn backup_dataset(dataset_config: &DatasetConfig, conn: &Connection) -> Result<(
                     }
                     
                     // Extract files that need to be synced
-                    let files_to_sync = extract_files_for_sync(&changes);
-                    
+                    let dataset_mountpoint = get_dataset_mountpoint(&dataset_config.name)?;
+                    let files_to_sync = extract_files_for_sync(&changes, &dataset_mountpoint);
+
                     if !files_to_sync.is_empty() {
                         // Get the snapshot mountpoint
                         let snapshot_mountpoint = get_snapshot_mountpoint(&latest_snapshot)?;
@@ -408,23 +409,36 @@ fn get_snapshot_mountpoint(snapshot: &str) -> Result<String, String> {
     let dataset = parts[0];
     let snapshot_name = parts[1];
     
-    // Get the mountpoint of the dataset
-    let output = Command::new("zfs")
-        .args(["get", "-H", "-o", "value", "mountpoint", dataset])
-        .output()
-        .map_err(|e| format!("Failed to get dataset mountpoint: {}", e))?;
+    // // Get the mountpoint of the dataset
+    // let output = Command::new("zfs")
+    //     .args(["get", "-H", "-o", "value", "mountpoint", dataset])
+    //     .output()
+    //     .map_err(|e| format!("Failed to get dataset mountpoint: {}", e))?;
     
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("zfs command failed: {}", stderr.trim()));
-    }
+    // if !output.status.success() {
+    //     let stderr = String::from_utf8_lossy(&output.stderr);
+    //     return Err(format!("zfs command failed: {}", stderr.trim()));
+    // }
     
-    let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mountpoint = match get_dataset_mountpoint(dataset) {
+        Ok(mountpoint) => mountpoint,
+        Err(e) => {return Err(e)}
+    };
     
     // Construct the snapshot path
     let snapshot_path = format!("{}/.zfs/snapshot/{}", mountpoint, snapshot_name);
+
     
     Ok(snapshot_path)
+}
+
+
+fn strip_mountpoint_prefix(file_path: &str, mountpoint: &str) -> String {
+    file_path.strip_prefix(mountpoint)
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or(file_path)
+        .to_string()
 }
 
 
@@ -467,8 +481,7 @@ fn parse_zfs_diff_line(line: &str) -> Option<(char, String)> {
         None
     }
 }
-
-fn extract_files_for_sync(changes: &[String]) -> Vec<String> {
+fn extract_files_for_sync(changes: &[String], mountpoint: &str) -> Vec<String> {
     let mut files_to_sync = Vec::new();
     
     for change in changes {
@@ -476,18 +489,18 @@ fn extract_files_for_sync(changes: &[String]) -> Vec<String> {
             match change_type {
                 '+' | 'M' => {
                     // Added or modified files need to be synced
-                    files_to_sync.push(file_path);
+                    let relative_path = strip_mountpoint_prefix(&file_path, mountpoint);
+                    files_to_sync.push(relative_path);
                 }
                 'R' => {
                     // For renames, we'll sync the new name
-                    // zfs diff shows renames as "R\told_path -> new_path"
                     if let Some(new_path) = file_path.split(" -> ").nth(1) {
-                        files_to_sync.push(new_path.to_string());
+                        let relative_path = strip_mountpoint_prefix(new_path, mountpoint);
+                        files_to_sync.push(relative_path);
                     }
                 }
                 '-' => {
                     // Deletions will be handled by rsync --delete if we do a full sync
-                    // For incremental, we'd need to handle this separately
                 }
                 _ => {}
             }
@@ -557,3 +570,16 @@ fn run_rsync_with_file_list(
 }
 
 
+fn get_dataset_mountpoint(dataset: &str) -> Result<String, String> {
+    let output = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", "mountpoint", dataset])
+        .output()
+        .map_err(|e| format!("Failed to get dataset mountpoint: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("zfs command failed: {}", stderr.trim()));
+    }
+    
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}

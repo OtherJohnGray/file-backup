@@ -253,19 +253,23 @@ fn backup_dataset(dataset_config: &DatasetConfig, conn: &Connection) -> Result<(
     }
     
     // Check database for last successful backup
-    match get_last_backed_up_snapshot(conn, "dataset", &dataset_config.name) {
-        Ok(_) => {}, // Result is already printed in the function
+    let last_backup = match get_last_backed_up_snapshot(conn, "dataset", &dataset_config.name) {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             eprintln!("Warning: Failed to query database: {}", e);
+            None
         }
-    }
+    };
     
     // Get the latest snapshot
-    match get_latest_snapshot(&dataset_config.name) {
-        Ok(Some(snapshot)) => println!("Latest snapshot: {}", snapshot),
-        Ok(None) => println!("No snapshots found for dataset '{}'", dataset_config.name),
-        Err(e) => { return Err(e) }
-    }
+    let latest_snapshot = match get_latest_snapshot(&dataset_config.name) {
+        Ok(Some(snapshot)) => {
+            println!("Latest snapshot: {}", snapshot);
+            snapshot
+        }
+        Ok(None) => {return Err(format!("No snapshots found for dataset '{}'", dataset_config.name))}
+        Err(e) => {return Err(e)}
+    };
     
     println!("Target directory: {}", dataset_config.target_dir.display());
 

@@ -2,6 +2,7 @@ use clap::Parser;
 use rusqlite::{Connection, Result as SqliteResult};
 use serde::Deserialize;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, exit};
 
@@ -306,21 +307,42 @@ fn backup_dataset(dataset_config: &DatasetConfig, conn: &Connection) -> Result<(
                 println!("Incremental backup needed (last: {}, current: {})", last_snap, latest_snapshot);
                 
                 // Get the diff between snapshots
-                match get_snapshot_diff(&last_snap, &latest_snapshot) {
-                    Ok(changes) => {
-                        println!("Found {} changed file(s):", changes.len());
-                        for change in &changes {
-                            println!("  {}", change);
-                        }
+                let changes = get_snapshot_diff(&last_snap, &latest_snapshot)?;
+                
+                if changes.is_empty() {
+                    println!("No changes detected between snapshots");
+                } else {
+                    println!("Found {} change(s):", changes.len());
+                    for change in &changes {
+                        println!("  {}", change);
                     }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to compute diff: {}", e);
+                    
+                    // Extract files that need to be synced
+                    let files_to_sync = extract_files_for_sync(&changes);
+                    
+                    if !files_to_sync.is_empty() {
+                        // Get the snapshot mountpoint
+                        let snapshot_mountpoint = get_snapshot_mountpoint(&latest_snapshot)?;
+                        let source_path = format!("{}/", snapshot_mountpoint);
+                        
+                        // Sync the changed files
+                        run_rsync_with_file_list(&source_path, &dataset_config.target_dir, &files_to_sync)?;
+                        
+                        // Record successful backup
+                        record_successful_backup(
+                            conn,
+                            "dataset",
+                            &dataset_config.name,
+                            &latest_snapshot,
+                            &dataset_config.target_dir.to_string_lossy(),
+                        )?;
+                        
+                        println!("Incremental backup recorded successfully");
                     }
                 }
-                
-                println!("Incremental backup not yet implemented - skipping");
             }
-        }    }
+        }
+    }
      
     println!(); // Blank line between datasets
     Ok(())
@@ -432,3 +454,106 @@ fn get_snapshot_diff(old_snapshot: &str, new_snapshot: &str) -> Result<Vec<Strin
     
     Ok(changed_files)
 }
+
+
+fn parse_zfs_diff_line(line: &str) -> Option<(char, String)> {
+    // Format: <change_type>\t<file_path>
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() >= 2 {
+        let change_type = parts[0].chars().next()?;
+        let file_path = parts[1].to_string();
+        Some((change_type, file_path))
+    } else {
+        None
+    }
+}
+
+fn extract_files_for_sync(changes: &[String]) -> Vec<String> {
+    let mut files_to_sync = Vec::new();
+    
+    for change in changes {
+        if let Some((change_type, file_path)) = parse_zfs_diff_line(change) {
+            match change_type {
+                '+' | 'M' => {
+                    // Added or modified files need to be synced
+                    files_to_sync.push(file_path);
+                }
+                'R' => {
+                    // For renames, we'll sync the new name
+                    // zfs diff shows renames as "R\told_path -> new_path"
+                    if let Some(new_path) = file_path.split(" -> ").nth(1) {
+                        files_to_sync.push(new_path.to_string());
+                    }
+                }
+                '-' => {
+                    // Deletions will be handled by rsync --delete if we do a full sync
+                    // For incremental, we'd need to handle this separately
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    files_to_sync
+}
+
+fn run_rsync_with_file_list(
+    source_path: &str,
+    target_dir: &PathBuf,
+    files: &[String],
+) -> Result<(), String> {
+    if files.is_empty() {
+        println!("No files to sync");
+        return Ok(());
+    }
+    
+    println!("Syncing {} file(s) with rsync...", files.len());
+    
+    // Create a temporary file with the list of files
+    let temp_file_path = "/tmp/rsync-files.txt";
+    let mut temp_file = fs::File::create(temp_file_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    // Write relative paths (without leading /)
+    for file in files {
+        let relative_path = file.strip_prefix('/').unwrap_or(file);
+        writeln!(temp_file, "{}", relative_path)
+            .map_err(|e| format!("Failed to write to temp file: {}", e))?;
+    }
+    
+    // Flush to ensure all data is written
+    temp_file.flush()
+        .map_err(|e| format!("Failed to flush temp file: {}", e))?;
+    
+    drop(temp_file); // Close the file
+    
+    println!("Source: {}", source_path);
+    println!("Target: {}", target_dir.display());
+    
+    let output = Command::new("rsync")
+        .args([
+            "-aAXHv",
+            "--relative",           // Preserve directory structure
+            "--files-from", temp_file_path,
+            source_path,
+            &target_dir.to_string_lossy().to_string(),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to execute rsync: {}", e))?;
+    
+    // Clean up temp file
+    let _ = fs::remove_file(temp_file_path);
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("rsync failed: {}", stderr.trim()));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{}", stdout);
+    
+    println!("Rsync completed successfully");
+    Ok(())
+}
+
+

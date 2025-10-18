@@ -304,10 +304,23 @@ fn backup_dataset(dataset_config: &DatasetConfig, conn: &Connection) -> Result<(
                 println!("Already backed up - nothing to do");
             } else {
                 println!("Incremental backup needed (last: {}, current: {})", last_snap, latest_snapshot);
+                
+                // Get the diff between snapshots
+                match get_snapshot_diff(&last_snap, &latest_snapshot) {
+                    Ok(changes) => {
+                        println!("Found {} changed file(s):", changes.len());
+                        for change in &changes {
+                            println!("  {}", change);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to compute diff: {}", e);
+                    }
+                }
+                
                 println!("Incremental backup not yet implemented - skipping");
             }
-        }
-    }
+        }    }
      
     println!(); // Blank line between datasets
     Ok(())
@@ -390,4 +403,32 @@ fn get_snapshot_mountpoint(snapshot: &str) -> Result<String, String> {
     let snapshot_path = format!("{}/.zfs/snapshot/{}", mountpoint, snapshot_name);
     
     Ok(snapshot_path)
+}
+
+
+fn get_snapshot_diff(old_snapshot: &str, new_snapshot: &str) -> Result<Vec<String>, String> {
+    println!("Computing differences between snapshots...");
+    
+    let output = Command::new("zfs")
+        .args(["diff", "-H", old_snapshot, new_snapshot])
+        .output()
+        .map_err(|e| format!("Failed to execute zfs diff: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("zfs diff failed: {}", stderr.trim()));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse the diff output
+    // Format is: <change_type>\t<file_path>
+    // Change types: M (modified), + (added), - (removed), R (renamed)
+    let changed_files: Vec<String> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+    
+    Ok(changed_files)
 }

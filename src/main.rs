@@ -22,13 +22,23 @@ struct Args {
 
 #[derive(Debug, Deserialize)]
 struct Config {
+    #[serde(default)]
     dataset: Vec<DatasetConfig>,
+    #[serde(default)]
+    restic: Vec<ResticConfig>,
 }
 
 
 #[derive(Debug, Deserialize)]
 struct DatasetConfig {
     name: String,
+    target_dir: PathBuf,
+}
+
+
+#[derive(Debug, Deserialize)]
+struct ResticConfig {
+    repository: String,
     target_dir: PathBuf,
 }
 
@@ -42,6 +52,11 @@ fn main() {
         exit(1);
     }    
 
+    // Check if restic is installed
+    if let Err(e) = check_restic_installed() {
+        eprintln!("Error: {}", e);
+        exit(1);
+    }    
 
     // Initialize database
     let conn = match init_database(&args.database) {
@@ -62,15 +77,31 @@ fn main() {
         }
     };   
 
-    println!("Processing {} dataset{}...\n", config.dataset.len(), match config.dataset.len() { 1 => {""} _ => {"s"} });     
-        
-     // Process each dataset
+    println!("Processing {} dataset{} and {} restic repositor{}...\n", 
+        config.dataset.len(), 
+        if config.dataset.len() == 1 { "" } else { "s" },
+        config.restic.len(),
+        if config.restic.len() == 1 { "y" } else { "ies" }
+    );
+            
+    // Process each dataset
     for dataset_config in &config.dataset {
         match backup_dataset(dataset_config, &conn) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("Error: {}", e);
                 eprintln!("Skipping dataset '{}'\n", dataset_config.name);
+            }
+        }
+    }
+
+    // Process each restic repository
+    for restic_config in &config.restic {
+        match backup_restic(restic_config, &conn) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                eprintln!("Skipping restic repository '{}'\n", restic_config.repository);
             }
         }
     }
@@ -176,6 +207,21 @@ fn check_rsync_installed() -> Result<(), String> {
 }
 
 
+fn check_restic_installed() -> Result<(), String> {
+    match Command::new("restic")
+        .arg("version")
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => Err("restic command failed".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("restic is not installed. Please install restic and try again.".to_string())
+        }
+        Err(e) => Err(format!("Failed to check for restic: {}", e)),
+    }
+}
+
+
 fn load_config(path: &PathBuf) -> Result<Config, String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
@@ -183,13 +229,12 @@ fn load_config(path: &PathBuf) -> Result<Config, String> {
     let config: Config = toml::from_str(&contents)
         .map_err(|e| format!("Failed to parse TOML: {}", e))?;
     
-    if config.dataset.is_empty() {
-        return Err("No datasets defined in config file".to_string());
+    if config.dataset.is_empty() && config.restic.is_empty() {
+        return Err("No datasets or restic repositories defined in config file".to_string());
     }
     
     Ok(config)
 }
-
 
 fn is_dataset_mounted(dataset: &str) -> Result<bool, String> {
     // Run `zfs get -H mounted <dataset>`
@@ -660,4 +705,205 @@ fn delete_files_from_target(target_dir: &PathBuf, files: &[String]) -> Result<()
     } else {
         Ok(())
     }
+}
+
+
+fn get_latest_restic_snapshot(repository: &str) -> Result<Option<String>, String> {
+    let output = Command::new("restic")
+        .args(["-r", repository, "snapshots", "--json", "--last"])
+        .output()
+        .map_err(|e| format!("Failed to execute restic: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Empty repository returns error, but that's okay
+        if stderr.contains("Is there a repository at the following location?") {
+            return Ok(None);
+        }
+        return Err(format!("restic command failed: {}", stderr.trim()));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() || stdout.trim() == "null" {
+        return Ok(None);
+    }
+    
+    // Parse JSON to get snapshot ID
+    // Restic returns an array with one snapshot when using --last
+    // Format: [{"time":"...","hostname":"...","username":"...","id":"abc123...",...}]
+    // For simplicity, we'll extract the ID using basic string parsing
+    if let Some(id_start) = stdout.find(r#""id":""#) {
+        let id_section = &stdout[id_start + 6..];
+        if let Some(id_end) = id_section.find('"') {
+            let snapshot_id = &id_section[..id_end];
+            return Ok(Some(snapshot_id.to_string()));
+        }
+    }
+    
+    Ok(None)
+}
+
+fn list_restic_files(repository: &str, snapshot_id: &str) -> Result<Vec<String>, String> {
+    let output = Command::new("restic")
+        .args(["-r", repository, "ls", snapshot_id, "--long"])
+        .output()
+        .map_err(|e| format!("Failed to execute restic ls: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("restic ls failed: {}", stderr.trim()));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<String> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            // Format: "drwxr-xr-x    0 2024-10-18 12:34:56 /path/to/file"
+            // We want just the path (last field)
+            line.split_whitespace().last().map(|s| s.to_string())
+        })
+        .collect();
+    
+    Ok(files)
+}
+
+fn restore_restic_files(
+    repository: &str,
+    snapshot_id: &str,
+    target_dir: &PathBuf,
+    files: &[String],
+) -> Result<(), String> {
+    if files.is_empty() {
+        println!("No files to restore");
+        return Ok(());
+    }
+    
+    println!("Restoring {} file(s) from restic...", files.len());
+    
+    // Restic restore with --include for specific files
+    let mut cmd = Command::new("restic");
+    cmd.args(["-r", repository, "restore", snapshot_id, "--target", &target_dir.to_string_lossy()]);
+    
+    // Add include patterns for each file
+    for file in files {
+        cmd.arg("--include").arg(file);
+    }
+    
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to execute restic restore: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("restic restore failed: {}", stderr.trim()));
+    }
+    
+    println!("Restic restore completed successfully");
+    Ok(())
+}
+
+fn backup_restic(restic_config: &ResticConfig, conn: &Connection) -> Result<(), String> {
+    println!("=== Restic Repository: {} ===", restic_config.repository);
+    
+    // Check if target directory exists
+    check_target_directory(&restic_config.target_dir)?;
+    
+    // Check database for last successful backup
+    let last_backup = match get_last_backed_up_snapshot(conn, "restic", &restic_config.repository) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            eprintln!("Warning: Failed to query database: {}", e);
+            None
+        }
+    };
+    
+    // Get the latest snapshot from restic repository
+    let latest_snapshot = match get_latest_restic_snapshot(&restic_config.repository) {
+        Ok(Some(snapshot)) => {
+            println!("Latest snapshot: {}", snapshot);
+            snapshot
+        }
+        Ok(None) => {
+            return Err(format!("No snapshots found in restic repository '{}'", restic_config.repository));
+        }
+        Err(e) => { return Err(e) }
+    };
+    
+    println!("Target directory: {}", restic_config.target_dir.display());
+    
+    // Determine if we need to backup
+    match last_backup {
+        None => {
+            // No previous backup - restore all files
+            println!("No previous backup found - performing full restore");
+            
+            let output = Command::new("restic")
+                .args([
+                    "-r", &restic_config.repository,
+                    "restore", &latest_snapshot,
+                    "--target", &restic_config.target_dir.to_string_lossy(),
+                ])
+                .output()
+                .map_err(|e| format!("Failed to execute restic restore: {}", e))?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("restic restore failed: {}", stderr.trim()));
+            }
+            
+            println!("Restic restore completed successfully");
+            
+            // Record successful backup
+            record_successful_backup(
+                conn,
+                "restic",
+                &restic_config.repository,
+                &latest_snapshot,
+                &restic_config.target_dir.to_string_lossy(),
+            )?;
+            
+            println!("Backup recorded successfully");
+        }
+        Some(last_snap) => {
+            if last_snap == latest_snapshot {
+                println!("Already backed up - nothing to do");
+            } else {
+                println!("Incremental backup needed (last: {}, current: {})", last_snap, latest_snapshot);
+                println!("Note: Restic doesn't support diff like ZFS - performing full restore");
+                println!("This will overwrite files in target directory");
+                
+                // For restic, we don't have a simple diff mechanism
+                // We'll just do a full restore which will overwrite existing files
+                let output = Command::new("restic")
+                    .args([
+                        "-r", &restic_config.repository,
+                        "restore", &latest_snapshot,
+                        "--target", &restic_config.target_dir.to_string_lossy(),
+                    ])
+                    .output()
+                    .map_err(|e| format!("Failed to execute restic restore: {}", e))?;
+                
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("restic restore failed: {}", stderr.trim()));
+                }
+                
+                println!("Restic restore completed successfully");
+                
+                // Record successful backup
+                record_successful_backup(
+                    conn,
+                    "restic",
+                    &restic_config.repository,
+                    &latest_snapshot,
+                    &restic_config.target_dir.to_string_lossy(),
+                )?;
+                
+                println!("Backup recorded successfully");
+            }
+        }
+    }
+    
+    println!(); // Blank line
+    Ok(())
 }

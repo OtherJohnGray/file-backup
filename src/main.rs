@@ -119,21 +119,45 @@ fn get_last_backed_up_snapshot(conn: &Connection, backup_type: &str, source_name
         "SELECT snapshot_name, backup_timestamp 
          FROM backup_history 
          WHERE backup_type = ?1 AND source_name = ?2 
-         ORDER BY backup_timestamp DESC 
-         LIMIT 1"
+         ORDER BY backup_timestamp DESC"
     )?;
     
     let mut rows = stmt.query([backup_type, source_name])?;
     
-    if let Some(row) = rows.next()? {
+    // Walk through backup history until we find a snapshot that still exists
+    while let Some(row) = rows.next()? {
         let snapshot_name: String = row.get(0)?;
         let timestamp: String = row.get(1)?;
-        println!("Last successful backup: {} (at {})", snapshot_name, timestamp);
-        Ok(Some(snapshot_name))
-    } else {
-        println!("No previous backup found in database");
-        Ok(None)
+        
+        // Check if this snapshot still exists
+        match snapshot_exists(&snapshot_name) {
+            Ok(true) => {
+                println!("Last successful backup: {} (at {})", snapshot_name, timestamp);
+                return Ok(Some(snapshot_name));
+            }
+            Ok(false) => {
+                println!("Snapshot {} no longer exists, checking older backups...", snapshot_name);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to check if snapshot exists: {}", e);
+                continue;
+            }
+        }
     }
+    
+    println!("No previous backup found with existing snapshot");
+    Ok(None)
+}
+
+
+fn snapshot_exists(snapshot: &str) -> Result<bool, String> {
+    let output = Command::new("zfs")
+        .args(["list", "-H", "-t", "snapshot", snapshot])
+        .output()
+        .map_err(|e| format!("Failed to execute zfs command: {}", e))?;
+    
+    Ok(output.status.success())
 }
 
 
@@ -320,26 +344,24 @@ fn backup_dataset(dataset_config: &DatasetConfig, conn: &Connection) -> Result<(
                     // Extract files that need to be synced
                     let dataset_mountpoint = get_dataset_mountpoint(&dataset_config.name)?;
                     let files_to_sync = extract_files_for_sync(&changes, &dataset_mountpoint);
-
+                    
+                    // Extract files that need to be deleted
+                    let files_to_delete = extract_files_for_deletion(&changes, &dataset_mountpoint);
+                    
+                    // Delete removed files first
+                    if !files_to_delete.is_empty() {
+                        delete_files_from_target(&dataset_config.target_dir, &files_to_delete)?;
+                    }
+                    
+                    // Then sync changed/new files
                     if !files_to_sync.is_empty() {
-                        // Get the snapshot mountpoint
                         let snapshot_mountpoint = get_snapshot_mountpoint(&latest_snapshot)?;
                         let source_path = format!("{}/", snapshot_mountpoint);
                         
-                        // Sync the changed files
                         run_rsync_with_file_list(&source_path, &dataset_config.target_dir, &files_to_sync)?;
-                        
-                        // Record successful backup
-                        record_successful_backup(
-                            conn,
-                            "dataset",
-                            &dataset_config.name,
-                            &latest_snapshot,
-                            &dataset_config.target_dir.to_string_lossy(),
-                        )?;
-                        
-                        println!("Incremental backup recorded successfully");
-                    }
+                    }                        
+
+                    println!("Incremental backup recorded successfully");
                 }
             }
         }
@@ -409,18 +431,6 @@ fn get_snapshot_mountpoint(snapshot: &str) -> Result<String, String> {
     let dataset = parts[0];
     let snapshot_name = parts[1];
     
-    // // Get the mountpoint of the dataset
-    // let output = Command::new("zfs")
-    //     .args(["get", "-H", "-o", "value", "mountpoint", dataset])
-    //     .output()
-    //     .map_err(|e| format!("Failed to get dataset mountpoint: {}", e))?;
-    
-    // if !output.status.success() {
-    //     let stderr = String::from_utf8_lossy(&output.stderr);
-    //     return Err(format!("zfs command failed: {}", stderr.trim()));
-    // }
-    
-    // let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let mountpoint = match get_dataset_mountpoint(dataset) {
         Ok(mountpoint) => mountpoint,
         Err(e) => {return Err(e)}
@@ -428,7 +438,6 @@ fn get_snapshot_mountpoint(snapshot: &str) -> Result<String, String> {
     
     // Construct the snapshot path
     let snapshot_path = format!("{}/.zfs/snapshot/{}", mountpoint, snapshot_name);
-
     
     Ok(snapshot_path)
 }
@@ -490,14 +499,18 @@ fn extract_files_for_sync(changes: &[String], mountpoint: &str) -> Vec<String> {
                 '+' | 'M' => {
                     // Added or modified files need to be synced
                     let relative_path = strip_mountpoint_prefix(&file_path, mountpoint);
-                    files_to_sync.push(relative_path);
-                }
+                    // Skip empty paths (the dataset root) and directory entries ending in /
+                    if !relative_path.is_empty() && !relative_path.ends_with('/') {
+                        files_to_sync.push(relative_path);
+                    }                }
                 'R' => {
                     // For renames, we'll sync the new name
                     if let Some(new_path) = file_path.split(" -> ").nth(1) {
                         let relative_path = strip_mountpoint_prefix(new_path, mountpoint);
+                    // Skip empty paths (the dataset root) and directory entries ending in /
+                    if !relative_path.is_empty() && !relative_path.ends_with('/') {
                         files_to_sync.push(relative_path);
-                    }
+                    }                    }
                 }
                 '-' => {
                     // Deletions will be handled by rsync --delete if we do a full sync
@@ -582,4 +595,69 @@ fn get_dataset_mountpoint(dataset: &str) -> Result<String, String> {
     }
     
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+
+fn extract_files_for_deletion(changes: &[String], mountpoint: &str) -> Vec<String> {
+    let mut files_to_delete = Vec::new();
+    
+    for change in changes {
+        if let Some((change_type, file_path)) = parse_zfs_diff_line(change) {
+            if change_type == '-' {
+                let relative_path = strip_mountpoint_prefix(&file_path, mountpoint);
+                if !relative_path.is_empty() {
+                    files_to_delete.push(relative_path);
+                }
+            }
+        }
+    }
+    
+    files_to_delete
+}
+
+fn delete_files_from_target(target_dir: &PathBuf, files: &[String]) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    
+    println!("Deleting {} item(s) from target...", files.len());
+    
+    let mut deleted_count = 0;
+    let mut error_count = 0;
+    
+    for file in files {
+        let target_path = target_dir.join(file);
+        
+        // Check if path exists and what type it is
+        let result = if target_path.is_dir() {
+            println!("  Deleting directory: {}", file);
+            fs::remove_dir_all(&target_path)
+        } else if target_path.is_file() {
+            println!("  Deleting file: {}", file);
+            fs::remove_file(&target_path)
+        } else {
+            // Path doesn't exist
+            println!("  Already gone: {}", file);
+            deleted_count += 1;
+            continue;
+        };
+        
+        match result {
+            Ok(()) => {
+                deleted_count += 1;
+            }
+            Err(e) => {
+                eprintln!("  Failed to delete {}: {}", file, e);
+                error_count += 1;
+            }
+        }
+    }
+    
+    println!("Deletion complete: {} deleted, {} errors", deleted_count, error_count);
+    
+    if error_count > 0 {
+        Err(format!("{} item(s) failed to delete", error_count))
+    } else {
+        Ok(())
+    }
 }

@@ -145,7 +145,11 @@ fn init_database(db_path: &PathBuf) -> Result<Connection, String> {
 }
 
 
-fn get_last_backed_up_snapshot(conn: &Connection, backup_type: &str, source_name: &str) -> SqliteResult<Option<String>> {
+fn get_last_backed_up_snapshot(
+    conn: &Connection, 
+    backup_type: &str, 
+    source_name: &str
+) -> SqliteResult<Option<String>> {
     let mut stmt = conn.prepare(
         "SELECT snapshot_name, backup_timestamp 
          FROM backup_history 
@@ -161,7 +165,7 @@ fn get_last_backed_up_snapshot(conn: &Connection, backup_type: &str, source_name
         let timestamp: String = row.get(1)?;
         
         // Check if this snapshot still exists
-        match snapshot_exists(&snapshot_name) {
+        match snapshot_exists(&snapshot_name, backup_type, source_name) {
             Ok(true) => {
                 println!("Last successful backup: {} (at {})", snapshot_name, timestamp);
                 return Ok(Some(snapshot_name));
@@ -181,14 +185,47 @@ fn get_last_backed_up_snapshot(conn: &Connection, backup_type: &str, source_name
     Ok(None)
 }
 
-
-fn snapshot_exists(snapshot: &str) -> Result<bool, String> {
-    let output = Command::new("zfs")
-        .args(["list", "-H", "-t", "snapshot", snapshot])
-        .output()
-        .map_err(|e| format!("Failed to execute zfs command: {}", e))?;
-    
-    Ok(output.status.success())
+fn snapshot_exists(snapshot: &str, backup_type: &str, source_name: &str) -> Result<bool, String> {
+    match backup_type {
+        "dataset" => {
+            let output = Command::new("zfs")
+                .args(["list", "-H", "-t", "snapshot", snapshot])
+                .output()
+                .map_err(|e| format!("Failed to execute zfs command: {}", e))?;
+            
+            Ok(output.status.success())
+        }
+        "restic" => {
+            // For restic, source_name is the repository path
+            let output = Command::new("restic")
+                .args(["-r", source_name, "snapshots", snapshot, "--json"])
+                .output()
+                .map_err(|e| format!("Failed to execute restic command: {}", e))?;
+            
+            
+            if !output.status.success() {
+                return Ok(false);
+            }
+            
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout_trimmed = stdout.trim();
+            
+            // Check if the JSON array is empty or the result is "[]"
+            // An existing snapshot returns a non-empty array
+            if stdout_trimmed.is_empty() || stdout_trimmed == "[]" {
+                return Ok(false);
+            }
+            
+            // Also check for the "Ignoring" warning message (though it's on stderr)
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("Ignoring") || stderr.contains("no matching ID found") {
+                return Ok(false);
+            }
+            
+            Ok(true)
+        }
+        _ => Err(format!("Unknown backup type: {}", backup_type))
+    }
 }
 
 

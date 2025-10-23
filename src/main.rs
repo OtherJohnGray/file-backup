@@ -780,72 +780,12 @@ fn get_latest_restic_snapshot(repository: &str) -> Result<Option<String>, String
     Ok(None)
 }
 
-fn list_restic_files(repository: &str, snapshot_id: &str) -> Result<Vec<String>, String> {
-    let output = Command::new("restic")
-        .args(["-r", repository, "ls", snapshot_id, "--long"])
-        .output()
-        .map_err(|e| format!("Failed to execute restic ls: {}", e))?;
-    
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("restic ls failed: {}", stderr.trim()));
-    }
-    
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<String> = stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            // Format: "drwxr-xr-x    0 2024-10-18 12:34:56 /path/to/file"
-            // We want just the path (last field)
-            line.split_whitespace().last().map(|s| s.to_string())
-        })
-        .collect();
-    
-    Ok(files)
-}
-
-fn restore_restic_files(
-    repository: &str,
-    snapshot_id: &str,
-    target_dir: &PathBuf,
-    files: &[String],
-) -> Result<(), String> {
-    if files.is_empty() {
-        println!("No files to restore");
-        return Ok(());
-    }
-    
-    println!("Restoring {} file(s) from restic...", files.len());
-    
-    // Restic restore with --include for specific files
-    let mut cmd = Command::new("restic");
-    cmd.args(["-r", repository, "restore", snapshot_id, "--target", &target_dir.to_string_lossy()]);
-    
-    // Add include patterns for each file
-    for file in files {
-        cmd.arg("--include").arg(file);
-    }
-    
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to execute restic restore: {}", e))?;
-    
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("restic restore failed: {}", stderr.trim()));
-    }
-    
-    println!("Restic restore completed successfully");
-    Ok(())
-}
 
 fn backup_restic(restic_config: &ResticConfig, conn: &Connection) -> Result<(), String> {
     println!("=== Restic Repository: {} ===", restic_config.repository);
     
-    // Check if target directory exists
     check_target_directory(&restic_config.target_dir)?;
     
-    // Check database for last successful backup
     let last_backup = match get_last_backed_up_snapshot(conn, "restic", &restic_config.repository) {
         Ok(snapshot) => snapshot,
         Err(e) => {
@@ -854,7 +794,6 @@ fn backup_restic(restic_config: &ResticConfig, conn: &Connection) -> Result<(), 
         }
     };
     
-    // Get the latest snapshot from restic repository
     let latest_snapshot = match get_latest_restic_snapshot(&restic_config.repository) {
         Ok(Some(snapshot)) => {
             println!("Latest snapshot: {}", snapshot);
@@ -868,29 +807,22 @@ fn backup_restic(restic_config: &ResticConfig, conn: &Connection) -> Result<(), 
     
     println!("Target directory: {}", restic_config.target_dir.display());
     
-    // Determine if we need to backup
     match last_backup {
         None => {
-            // No previous backup - restore all files
-            println!("No previous backup found - performing full restore");
+            println!("No previous backup found - performing full copy");
             
-            let output = Command::new("restic")
-                .args([
-                    "-r", &restic_config.repository,
-                    "restore", &latest_snapshot,
-                    "--target", &restic_config.target_dir.to_string_lossy(),
-                ])
-                .output()
-                .map_err(|e| format!("Failed to execute restic restore: {}", e))?;
+            // Mount the latest snapshot and rsync from it
+            let mount_point = PathBuf::from("/tmp/restic-mount-latest");
+            fs::create_dir_all(&mount_point)
+                .map_err(|e| format!("Failed to create mount point: {}", e))?;
             
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("restic restore failed: {}", stderr.trim()));
-            }
+            let _mount_guard = mount_restic_snapshot(&restic_config.repository, &latest_snapshot, &mount_point)?;
             
-            println!("Restic restore completed successfully");
+            let source_path = format!("{}/", mount_point.display());
+            run_rsync(&source_path, &restic_config.target_dir)?;
             
-            // Record successful backup
+            // Mount will be unmounted when _mount_guard is dropped
+            
             record_successful_backup(
                 conn,
                 "restic",
@@ -906,28 +838,34 @@ fn backup_restic(restic_config: &ResticConfig, conn: &Connection) -> Result<(), 
                 println!("Already backed up - nothing to do");
             } else {
                 println!("Incremental backup needed (last: {}, current: {})", last_snap, latest_snapshot);
-                println!("Note: Restic doesn't support diff like ZFS - performing full restore");
-                println!("This will overwrite files in target directory");
                 
-                // For restic, we don't have a simple diff mechanism
-                // We'll just do a full restore which will overwrite existing files
-                let output = Command::new("restic")
-                    .args([
-                        "-r", &restic_config.repository,
-                        "restore", &latest_snapshot,
-                        "--target", &restic_config.target_dir.to_string_lossy(),
-                    ])
-                    .output()
-                    .map_err(|e| format!("Failed to execute restic restore: {}", e))?;
+                // Mount both snapshots
+                let mount_old = PathBuf::from("/tmp/restic-mount-old");
+                let mount_new = PathBuf::from("/tmp/restic-mount-new");
+                fs::create_dir_all(&mount_old)
+                    .map_err(|e| format!("Failed to create mount point: {}", e))?;
+                fs::create_dir_all(&mount_new)
+                    .map_err(|e| format!("Failed to create mount point: {}", e))?;
                 
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(format!("restic restore failed: {}", stderr.trim()));
+                let _mount_guard_old = mount_restic_snapshot(&restic_config.repository, &last_snap, &mount_old)?;
+                let _mount_guard_new = mount_restic_snapshot(&restic_config.repository, &latest_snapshot, &mount_new)?;
+                
+                // Get diff using rsync dry-run
+                let changes = get_restic_diff_via_rsync(&mount_old, &mount_new)?;
+                
+                if changes.is_empty() {
+                    println!("No changes detected between snapshots");
+                } else {
+                    println!("Found {} change(s)", changes.len());
+                    
+                    // Sync changed files from new snapshot
+                    let source_path = format!("{}/", mount_new.display());
+                    run_rsync_with_file_list(&source_path, &restic_config.target_dir, &changes)?;
+                    
+                    // Note: Deletions would need to be handled separately
+                    // We could compare the file lists from both mounts
                 }
                 
-                println!("Restic restore completed successfully");
-                
-                // Record successful backup
                 record_successful_backup(
                     conn,
                     "restic",
@@ -936,11 +874,111 @@ fn backup_restic(restic_config: &ResticConfig, conn: &Connection) -> Result<(), 
                     &restic_config.target_dir.to_string_lossy(),
                 )?;
                 
-                println!("Backup recorded successfully");
+                println!("Incremental backup recorded successfully");
             }
         }
     }
     
-    println!(); // Blank line
+    println!();
     Ok(())
+}
+
+// RAII guard to ensure restic unmount
+struct ResticMountGuard {
+    mount_point: PathBuf,
+}
+
+impl Drop for ResticMountGuard {
+    fn drop(&mut self) {
+        println!("Unmounting restic at {}...", self.mount_point.display());
+        let _ = Command::new("fusermount")
+            .args(["-u", &self.mount_point.to_string_lossy()])
+            .output();
+    }
+}
+
+fn mount_restic_snapshot(repository: &str, snapshot_id: &str, mount_point: &PathBuf) -> Result<ResticMountGuard, String> {
+    println!("Mounting restic snapshot {} at {}...", snapshot_id, mount_point.display());
+    
+    // Start restic mount in background
+    let mut child = Command::new("restic")
+        .args([
+            "-r", repository,
+            "mount", &mount_point.to_string_lossy(),
+            "--snapshot-template", snapshot_id,
+        ])
+        .spawn()
+        .map_err(|e| format!("Failed to start restic mount: {}", e))?;
+    
+    // Wait a bit for mount to be ready
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    
+    // Check if mount succeeded by checking if directory is accessible
+    if !mount_point.join("snapshots").exists() {
+        let _ = child.kill();
+        return Err("Restic mount failed or not ready".to_string());
+    }
+    
+    println!("Restic mounted successfully");
+    
+    Ok(ResticMountGuard {
+        mount_point: mount_point.clone(),
+    })
+}
+
+fn get_restic_diff_via_rsync(old_mount: &PathBuf, new_mount: &PathBuf) -> Result<(Vec<String>, Vec<String>), String> {
+    println!("Computing differences using rsync...");
+    
+    let old_path = format!("{}/snapshots/latest/", old_mount.display());
+    let new_path = format!("{}/snapshots/latest/", new_mount.display());
+    
+    // Compare new to old to find additions and modifications
+    let output = Command::new("rsync")
+        .args([
+            "-aAXHn",
+            "--itemize-changes",
+            &new_path,
+            &old_path,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to execute rsync: {}", e))?;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    let mut added_modified = Vec::new();
+    
+    for line in stdout.lines() {
+        if line.is_empty() || line.starts_with(".d") {
+            continue;
+        }
+        if let Some((_, path)) = line.split_once("  ") {
+            added_modified.push(path.to_string());
+        }
+    }
+    
+    // Compare old to new to find deletions
+    let output = Command::new("rsync")
+        .args([
+            "-aAXHn",
+            "--itemize-changes",
+            "--delete",
+            &old_path,
+            &new_path,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to execute rsync: {}", e))?;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    let mut deleted = Vec::new();
+    
+    for line in stdout.lines() {
+        if line.starts_with("*deleting") {
+            if let Some(path) = line.strip_prefix("*deleting   ") {
+                deleted.push(path.to_string());
+            }
+        }
+    }
+    
+    Ok((added_modified, deleted))
 }
